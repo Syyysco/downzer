@@ -10,6 +10,7 @@ mod core;
 mod ipc;
 mod audio;
 mod ui;
+mod modes;
 
 use crate::core::Downzer;
 use crate::core::task::{TaskStatus, TaskInfo};
@@ -25,6 +26,10 @@ struct Cli {
     /// URL template with FUZZW1, FUZZW2, ... or FUZZR placeholders
     #[arg(value_name = "URL")]
     url: Option<String>,
+
+    /// Mode: download, webrequest, portscan, ssh, ftp, mail, telnet
+    #[arg(short = 'm', long = "mode", default_value = "download")]
+    mode: String,
 
     /// Range to replace FUZZR (e.g., 0-30)
     #[arg(short = 'r', long = "range")]
@@ -97,6 +102,42 @@ struct Cli {
     /// Timeout per request in seconds
     #[arg(long, default_value = "30")]
     timeout: u64,
+
+    /// HTTP method for web requests (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)
+    #[arg(long)]
+    method: Option<String>,
+
+    /// Data to send in request body (for POST, PUT, PATCH)
+    #[arg(long)]
+    data: Option<String>,
+
+    /// File containing data to send in request body
+    #[arg(long)]
+    data_file: Option<PathBuf>,
+
+    /// Download response body (--dd or -dd)
+    #[arg(long = "dd", alias = "download-body")]
+    download_body: bool,
+
+    /// Randomize MAC address
+    #[arg(long)]
+    random_mac: bool,
+
+    /// Custom MAC address or file with MAC addresses
+    #[arg(long)]
+    mac: Option<String>,
+
+    /// Randomize User-Agent
+    #[arg(long)]
+    random_ua: bool,
+
+    /// Custom User-Agent or file with User-Agents
+    #[arg(long)]
+    ua: Option<String>,
+
+    /// Disable DNS resolution
+    #[arg(short = 'n', long = "nodns")]
+    no_dns: bool,
 }
 
 #[derive(Subcommand)]
@@ -262,12 +303,12 @@ async fn main() -> anyhow::Result<()> {
     // IPC shared state
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Ctrl+C handler
-    let shutdown_handler = shutdown.clone();
-    ctrlc::set_handler(move || {
-        println!("\n{} Shutting down...", "[!]".yellow());
-        shutdown_handler.store(true, Ordering::SeqCst);
-    })?;
+    // Setup Ctrl+C handler using tokio's signal handling
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal.store(true, Ordering::SeqCst);
+    });
 
     // Initialize Downzer
     if cli.verbose >= 1 {
@@ -276,13 +317,16 @@ async fn main() -> anyhow::Result<()> {
     
     let downzer = Downzer::new(cli.proxy.clone(), cli.timeout).await?;
 
-    // Start IPC server in background (no es crítico si falla)
-    let downzer_ipc = downzer.clone();
-    let shutdown_ipc = shutdown.clone();
-    let _ipc_handle = tokio::spawn(async move {
-        // Ignorar errores de IPC, no es crítico
-        let _ = ipc::run_ipc_server(downzer_ipc, shutdown_ipc);
-    });
+    // Start IPC server in background only if not running in quick mode
+    // IPC server is blocking, so only start it if we expect interactive use
+    if cli.add || cli.queue {
+        let downzer_ipc = downzer.clone();
+        let shutdown_ipc = shutdown.clone();
+        std::thread::spawn(move || {
+            // Ignorar errores de IPC, no es crítico
+            let _ = ipc::run_ipc_server(downzer_ipc, shutdown_ipc);
+        });
+    }
 
     // Get next task ID
     let task_id = {
@@ -310,37 +354,70 @@ async fn main() -> anyhow::Result<()> {
         println!();
     }
 
-    // Spawn download task
+    // Parse MAC addresses
+    let mac_list = if let Some(mac_str) = &cli.mac {
+        Downzer::parse_wordlist(mac_str).await?
+    } else {
+        vec![]
+    };
+
+    // Parse User-Agents
+    let ua_list = if let Some(ua_str) = &cli.ua {
+        Downzer::parse_wordlist(ua_str).await?
+    } else {
+        vec![]
+    };
+
+    // Create mode configuration
+    let mode_config = modes::ModeConfig {
+        mode: cli.mode.clone(),
+        url_or_target: url_template.clone(),
+        method: cli.method.clone(),
+        data: cli.data.clone(),
+        data_file: cli.data_file.clone(),
+        download_body: cli.download_body,
+        mac: if mac_list.is_empty() { None } else { Some(mac_list) },
+        ua: if ua_list.is_empty() { None } else { Some(ua_list) },
+        no_dns: cli.no_dns,
+        timeout: cli.timeout,
+        max_concurrent: cli.max_concurrent,
+        verbose: cli.verbose,
+        quiet: cli.quiet,
+        outdir: cli.outdir.clone(),
+        proxy: cli.proxy.clone(),
+    };
+
+    // Spawn mode executor task with shutdown support
     let downzer_worker = downzer.clone();
     let shutdown_worker = shutdown.clone();
-    let output_dir = cli.outdir.clone();
-    let content_types_copy = content_types.clone();
-    let max_concurrent = cli.max_concurrent;
-    let verbose = cli.verbose;
-    let debug = cli.debug;
     let urls_copy = urls.clone();
     let quiet = cli.quiet;
+    let verbose = cli.verbose;
 
-    let download_handle = tokio::spawn(async move {
-        match downzer_worker.execute_download_task(
-            task_id,
-            &url_template,
+    let executor_handle = tokio::spawn(async move {
+        match modes::execute_mode(
+            mode_config,
+            downzer_worker.clone(),
             urls_copy,
-            &output_dir,
-            &content_types_copy,
-            max_concurrent,
-            verbose,
-            debug,
+            shutdown_worker.clone(),
+            task_id,
         ).await {
-            Ok(stats) => {
+            Ok(result) => {
                 if verbose >= 1 || !quiet {
                     println!("\n{}", "═══════════════════════════════════════".green());
-                    println!("{} Task #{} completed successfully", "[✓]".green(), task_id);
-                    println!("  Downloaded:  {}", stats.downloaded);
-                    println!("  Ignored:     {}", stats.ignored);
-                    println!("  Not Found:   {}", stats.not_found);
-                    println!("  Errors:      {}", stats.errors);
-                    println!("  Total bytes: {}", stats.total_bytes);
+                    println!("{} Task #{} completed", "[✓]".green(), task_id);
+                    println!("  Mode: {} ({})", result.mode, result.total);
+                    println!("  Successful: {}", result.successful);
+                    println!("  Failed:     {}", result.failed);
+                    if !result.errors.is_empty() && verbose >= 2 {
+                        println!("  Errors:");
+                        for err in &result.errors {
+                            println!("    - {}", err);
+                        }
+                    }
+                    if let Some(custom) = &result.custom_data {
+                        println!("  Details: {}", custom);
+                    }
                     println!("{}", "═══════════════════════════════════════".green());
                 }
                 shutdown_worker.store(true, Ordering::SeqCst);
@@ -352,15 +429,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Wait for download to complete
-    let _ = download_handle.await;
+    // Wait for executor to complete
+    let _ = executor_handle.await;
 
     // Cleanup
-    println!("{} Cleaning up...", "[*]".blue());
+    println!("{} Limpiando...", "[*]".blue());
     shutdown.store(true, Ordering::SeqCst);
     
-    // Wait a bit for IPC to shutdown
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait a moment for tasks to cleanup
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cleanup socket files
+    let _ = ipc::cleanup_old_sockets();
 
     if !cli.quiet {
         println!("{} Done!", "[✓]".green());

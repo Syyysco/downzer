@@ -11,6 +11,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    path::PathBuf,
 };
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
@@ -34,8 +35,40 @@ pub enum IpcResponse {
     Error(String),
 }
 
+pub fn get_socket_path() -> PathBuf {
+    #[cfg(unix)]
+    {
+        let mut path = PathBuf::from("/tmp");
+        path.push("downzer_ipc.sock");
+        path
+    }
+    
+    #[cfg(windows)]
+    {
+        // En Windows, usar un nombre abstracto que interprocess maneja automáticamente
+        let mut path = std::env::temp_dir();
+        path.push("downzer_ipc.sock");
+        path
+    }
+}
+
+pub fn cleanup_old_sockets() -> Result<()> {
+    let socket_path = get_socket_path();
+    
+    // Intentar remover socket antigua si existe
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path).ok();
+    }
+    
+    Ok(())
+}
+
 pub fn get_ipc_name() -> Result<interprocess::local_socket::Name<'static>> {
-    "downzer_ipc.sock"
+    let path_str = get_socket_path()
+        .to_string_lossy()
+        .to_string();
+    
+    path_str
         .to_fs_name::<GenericFilePath>()
         .context("Failed to generate socket name")
 }
@@ -44,20 +77,22 @@ pub fn run_ipc_server(
     downzer: Arc<Downzer>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
+    // Limpiar socket antigua
+    cleanup_old_sockets()?;
+    
     let name = get_ipc_name()?;
-
-    // Limpiar socket anterior si existe
-    #[cfg(unix)]
-    {
-        let _ = std::fs::remove_file("/tmp/downzer_ipc.sock");
-    }
 
     let listener = ListenerOptions::new()
         .name(name)
         .create_sync()
         .context("Failed to create IPC listener")?;
 
-    while !shutdown.load(Ordering::SeqCst) {
+    // Check shutdown frequently even if no connections
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
         match listener.accept() {
             Ok(conn) => {
                 let downzer = downzer.clone();
@@ -69,9 +104,9 @@ pub fn run_ipc_server(
                     }
                 });
             }
-            Err(e) => {
-                eprintln!("Failed to accept connection: {e}");
-                break;
+            Err(_e) => {
+                // Accept failed or no connection, try again after a brief sleep
+                thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }
